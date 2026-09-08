@@ -12,6 +12,8 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <fstream>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
@@ -23,12 +25,52 @@
 
 // LOOK-2.1 LOOK-2.3 - toggles for UNIFORM_GRID and COHERENT_GRID
 #define VISUALIZE 1
-#define UNIFORM_GRID 1
-#define COHERENT_GRID 1
+// Runtime (not compile-time) so runBenchmark() can sweep through all three
+// implementations in one process without a rebuild.
+bool UNIFORM_GRID = true;
+bool COHERENT_GRID = true;
+
+// Set to true to run the automated performance sweep in runBenchmark()
+// instead of the normal interactive loop. Works with VISUALIZE either way.
+// With VISUALIZE 1, runBenchmark() renders and presents each frame (see
+// renderBenchmarkFrame()), so the results reflect real draw and copy
+// overhead. With VISUALIZE 0 it stays fully headless.
+const bool RUN_BENCHMARK = false;
 
 // LOOK-1.2 - change this to adjust particle count in the simulation
-const int N_FOR_VIS = 100000;
+const int N_FOR_VIS = 5000;
 const float DT = 0.2f;
+
+// Boid counts swept for every implementation in runBenchmark(). Declared
+// here, before initVAO(), so initVAO() can size the VBOs and IBO to cover
+// the largest one (see MAX_VIS_BOIDS below). Block size and grid cell width
+// aren't swept here since they're compile-time constants in kernel.cu.
+// Change one by hand, rebuild, and rerun the benchmark to get a data point
+// for those graphs.
+const int BENCHMARK_BOID_COUNTS[] = { 500, 1000, 5000, 10000, 50000, 100000, 500000 };
+
+// initVAO() allocates the boid VBOs and IBO once, at startup, sized for
+// however many boids will ever need to be drawn in this run. runBenchmark()
+// never resizes them later when it changes boid count via initSimulation().
+// Must cover both the normal interactive count and every benchmark sweep
+// value. Adds one to safely cover mainLoop()'s `N_FOR_VIS + 1` glDrawElements
+// call.
+int computeMaxVisBoids() {
+  int maxN = N_FOR_VIS;
+  for (int n : BENCHMARK_BOID_COUNTS) {
+    if (n > maxN) {
+      maxN = n;
+    }
+  }
+  return maxN + 1;
+}
+const int MAX_VIS_BOIDS = computeMaxVisBoids();
+
+// How many boids to actually draw right now. Equals N_FOR_VIS for the whole
+// run in normal interactive mode. runBenchmark() updates this whenever it
+// changes boid count, so a with-visualization sweep draws the right number
+// of points at each step instead of whatever N_FOR_VIS happened to be.
+int currentVisBoidCount = N_FOR_VIS;
 
 /**
 * C main function.
@@ -37,7 +79,11 @@ int main(int argc, char* argv[]) {
   projectName = "5650 CUDA Intro: Boids";
 
   if (init(argc, argv)) {
-    mainLoop();
+    if (RUN_BENCHMARK) {
+      runBenchmark();
+    } else {
+      mainLoop();
+    }
     Boids::endSimulation();
     return 0;
   } else {
@@ -131,13 +177,16 @@ bool init(int argc, char **argv) {
 
 void initVAO() {
 
-  std::unique_ptr<GLfloat[]> bodies{ new GLfloat[4 * (N_FOR_VIS)] };
-  std::unique_ptr<GLuint[]> bindices{ new GLuint[N_FOR_VIS] };
+  // Sized to MAX_VIS_BOIDS, not N_FOR_VIS, so these buffers are big enough
+  // for every boid count runBenchmark() will ever use, not just the initial
+  // interactive one. See the comment on MAX_VIS_BOIDS above.
+  std::unique_ptr<GLfloat[]> bodies{ new GLfloat[4 * (MAX_VIS_BOIDS)] };
+  std::unique_ptr<GLuint[]> bindices{ new GLuint[MAX_VIS_BOIDS] };
 
   glm::vec4 ul(-1.0, -1.0, 1.0, 1.0);
   glm::vec4 lr(1.0, 1.0, 0.0, 0.0);
 
-  for (int i = 0; i < N_FOR_VIS; i++) {
+  for (int i = 0; i < MAX_VIS_BOIDS; i++) {
     bodies[4 * i + 0] = 0.0f;
     bodies[4 * i + 1] = 0.0f;
     bodies[4 * i + 2] = 0.0f;
@@ -155,19 +204,19 @@ void initVAO() {
 
   // Bind the positions array to the boidVAO by way of the boidVBO_positions
   glBindBuffer(GL_ARRAY_BUFFER, boidVBO_positions); // bind the buffer
-  glBufferData(GL_ARRAY_BUFFER, 4 * (N_FOR_VIS) * sizeof(GLfloat), bodies.get(), GL_DYNAMIC_DRAW); // transfer data
+  glBufferData(GL_ARRAY_BUFFER, 4 * (MAX_VIS_BOIDS) * sizeof(GLfloat), bodies.get(), GL_DYNAMIC_DRAW); // transfer data
 
   glEnableVertexAttribArray(positionLocation);
   glVertexAttribPointer((GLuint)positionLocation, 4, GL_FLOAT, GL_FALSE, 0, 0);
 
   // Bind the velocities array to the boidVAO by way of the boidVBO_velocities
   glBindBuffer(GL_ARRAY_BUFFER, boidVBO_velocities);
-  glBufferData(GL_ARRAY_BUFFER, 4 * (N_FOR_VIS) * sizeof(GLfloat), bodies.get(), GL_DYNAMIC_DRAW);
+  glBufferData(GL_ARRAY_BUFFER, 4 * (MAX_VIS_BOIDS) * sizeof(GLfloat), bodies.get(), GL_DYNAMIC_DRAW);
   glEnableVertexAttribArray(velocitiesLocation);
   glVertexAttribPointer((GLuint)velocitiesLocation, 4, GL_FLOAT, GL_FALSE, 0, 0);
 
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, boidIBO);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER, (N_FOR_VIS) * sizeof(GLuint), bindices.get(), GL_STATIC_DRAW);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, (MAX_VIS_BOIDS) * sizeof(GLuint), bindices.get(), GL_STATIC_DRAW);
 
   glBindVertexArray(0);
 }
@@ -205,13 +254,13 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 
     // execute the kernel
-    #if UNIFORM_GRID && COHERENT_GRID
-    Boids::stepSimulationCoherentGrid(DT);
-    #elif UNIFORM_GRID
-    Boids::stepSimulationScatteredGrid(DT);
-    #else
-    Boids::stepSimulationNaive(DT);
-    #endif
+    if (UNIFORM_GRID && COHERENT_GRID) {
+      Boids::stepSimulationCoherentGrid(DT);
+    } else if (UNIFORM_GRID) {
+      Boids::stepSimulationScatteredGrid(DT);
+    } else {
+      Boids::stepSimulationNaive(DT);
+    }
 
     #if VISUALIZE
     Boids::copyBoidsToVBO(dptrVertPositions, dptrVertVelocities);
@@ -269,6 +318,125 @@ void initShaders(GLuint * program) {
     glfwTerminate();
   }
 
+  //====================================
+  // Automated performance benchmarking
+  //====================================
+
+  struct BenchmarkResult {
+    std::string implementation;
+    int numBoids;
+    double avgFps;
+  };
+
+  const double BENCHMARK_WARMUP_SECONDS = 5.0;
+  const int BENCHMARK_NUM_SAMPLES = 5;
+
+  // Draws and presents one frame for runBenchmark(), mirroring what
+  // mainLoop() does each frame (clear/draw/swap). A separate function from
+  // mainLoop() rather than a shared helper, so the already-working
+  // interactive path stays untouched. Entirely a no-op when VISUALIZE is 0,
+  // same as mainLoop().
+  void renderBenchmarkFrame() {
+    #if VISUALIZE
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glUseProgram(program[PROG_BOID]);
+    glBindVertexArray(boidVAO);
+    glPointSize((GLfloat)pointSize);
+    glDrawElements(GL_POINTS, currentVisBoidCount, GL_UNSIGNED_INT, 0);
+    glPointSize(1.0f);
+    glUseProgram(0);
+    glBindVertexArray(0);
+    glfwSwapBuffers(window);
+    #endif
+  }
+
+  // Runs the simulation for `seconds` of real time without recording
+  // anything, so the flock can settle after a fresh initSimulation() before
+  // measurement starts.
+  void benchmarkWarmup(double seconds) {
+    double start = glfwGetTime();
+    while (glfwGetTime() - start < seconds && !glfwWindowShouldClose(window)) {
+      glfwPollEvents();
+      runCUDA();
+      renderBenchmarkFrame();
+    }
+  }
+
+  // Runs the simulation for exactly one second of real time and returns the
+  // resulting fps, using the same frame-count / elapsed-time approach as
+  // mainLoop()'s title bar counter.
+  double benchmarkSampleOneSecond() {
+    int frame = 0;
+    double timebase = glfwGetTime();
+    double time = timebase;
+    while (time - timebase < 1.0 && !glfwWindowShouldClose(window)) {
+      glfwPollEvents();
+      runCUDA();
+      renderBenchmarkFrame();
+      frame++;
+      time = glfwGetTime();
+    }
+    return frame / (time - timebase);
+  }
+
+  void runBenchmark() {
+    struct Implementation { const char *name; bool uniformGrid; bool coherentGrid; };
+    const Implementation implementations[] = {
+      { "naive",     false, false },
+      { "scattered", true,  false },
+      { "coherent",  true,  true  },
+    };
+
+    std::vector<BenchmarkResult> results;
+
+    for (const Implementation &impl : implementations) {
+      UNIFORM_GRID = impl.uniformGrid;
+      COHERENT_GRID = impl.coherentGrid;
+
+      for (int n : BENCHMARK_BOID_COUNTS) {
+        if (glfwWindowShouldClose(window)) {
+          break;
+        }
+
+        std::cout << "Benchmarking " << impl.name << ", N = " << n << " ..." << std::endl;
+
+        // Reset the CUDA-side buffers to the new boid count. Safe to call
+        // endSimulation() here even on the first iteration. init() already
+        // ran initSimulation(N_FOR_VIS) once before runBenchmark() started.
+        Boids::endSimulation();
+        Boids::initSimulation(n);
+        currentVisBoidCount = n;
+
+        benchmarkWarmup(BENCHMARK_WARMUP_SECONDS);
+
+        double fpsSum = 0.0;
+        for (int i = 0; i < BENCHMARK_NUM_SAMPLES; i++) {
+          fpsSum += benchmarkSampleOneSecond();
+        }
+        double avgFps = fpsSum / BENCHMARK_NUM_SAMPLES;
+
+        results.push_back({ impl.name, n, avgFps });
+        std::cout << "  -> " << avgFps << " fps" << std::endl;
+      }
+    }
+
+    std::ostringstream out;
+    out << "implementation,numBoids,avgFps" << std::endl;
+    for (const BenchmarkResult &r : results) {
+      out << r.implementation << "," << r.numBoids << "," << r.avgFps << std::endl;
+    }
+
+    std::cout << std::endl << out.str();
+
+    std::ofstream file("benchmark_results.txt");
+    if (file.is_open()) {
+      file << out.str();
+      file.close();
+      std::cout << "Results written to benchmark_results.txt" << std::endl;
+    } else {
+      std::cout << "Warning: could not open benchmark_results.txt for writing" << std::endl;
+    }
+  }
 
   void errorCallback(int error, const char *description) {
     fprintf(stderr, "error %d: %s\n", error, description);
